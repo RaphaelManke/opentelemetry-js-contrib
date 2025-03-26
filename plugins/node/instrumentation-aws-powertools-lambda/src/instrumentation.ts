@@ -18,9 +18,16 @@ import {
   InstrumentationConfig,
   InstrumentationNodeModuleDefinition,
 } from '@opentelemetry/instrumentation';
-/** @knipignore */
-// import type * as BatchModule from '@aws-lambda-powertools/batch';
+import type * as BatchModule from '@aws-lambda-powertools/batch';
 import { PACKAGE_NAME, PACKAGE_VERSION } from './version';
+import { Attributes, diag, propagation, ROOT_CONTEXT, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
+import { BaseRecord } from '@aws-lambda-powertools/batch/types';
+import { SQSRecord } from 'aws-lambda';
+import { ATTR_MESSAGING_MESSAGE_ID } from '@opentelemetry/semantic-conventions/incubating';
+import { convertSqsMessageAttributesToObject, extractOpenTelemetrySemanticSpanAttributesFromSQSRecord } from './sqsBatch';
+
+export interface AwsLambdaPowertoolsInstrumentationConfig extends InstrumentationConfig {
+}
 
 export class AwsLambdaPowertoolsInstrumentation extends InstrumentationBase {
   constructor(config: InstrumentationConfig = {}) {
@@ -28,51 +35,48 @@ export class AwsLambdaPowertoolsInstrumentation extends InstrumentationBase {
   }
 
   init(): InstrumentationNodeModuleDefinition[] {
-    console.log('Initializing AWS Lambda Powertools instrumentation');
+    diag.debug('Initializing Powertools for AWS Lambda instrumentation');
     return [
       new InstrumentationNodeModuleDefinition(
         '@aws-lambda-powertools/batch',
         ['*'],
-        (moduleExports: any) => {
-          console.log('Patching BatchProcessor');
-
-          // Handle both ESM and CommonJS formats in the same function
-          const BatchProcessor =
-            moduleExports.default?.BatchProcessor || // ESM case
-            moduleExports.BatchProcessor; // CommonJS case
-
-          if (typeof BatchProcessor !== 'function') {
+        (moduleExports: typeof BatchModule) => {
+         diag.debug('Patching BatchProcessor');
+          if (typeof moduleExports.BatchProcessor !== 'function') {
+            diag.debug('Module does not export a BatchProcessor as function');
             return moduleExports;
           }
 
           const instrumentation = this;
-          this._wrap(BatchProcessor.prototype, 'processRecord', original => {
-            return async function (record: any) {
-              console.log('patched processRecord');
+          
+          this._wrap(moduleExports.BatchProcessor.prototype, 'processRecord', (original) => {
+            return async function(this: BatchModule.BatchProcessor, record: BaseRecord) {
+              diag.debug('Powertools for AWS Lambda - processRecord');
+             
+              const span = instrumentation.tracer.startSpan('process record', {
+                kind: SpanKind.CONSUMER,
+              });
 
-              const span = instrumentation.tracer.startSpan(
-                'aws.lambda.batch.process_record',
-                {
-                  attributes: {
-                    // @ts-ignore
-                    'aws.lambda.batch.record_id':
-                      record.messageId || record.eventID,
-                  },
+              if (this.eventType === "SQS") {
+                const sqsRecord = record as SQSRecord;
+                const sqsMessageAttributesObject = convertSqsMessageAttributesToObject(sqsRecord.messageAttributes);
+                const ctx = propagation.extract(ROOT_CONTEXT, sqsMessageAttributesObject)
+                const spanContext = trace.getSpanContext(ctx)
+                if (spanContext) {
+                  span.addLink({context: spanContext, attributes: { [ATTR_MESSAGING_MESSAGE_ID]: sqsRecord.messageId}})
                 }
-              );
+                const attributes = extractOpenTelemetrySemanticSpanAttributesFromSQSRecord(sqsRecord)
+                span.setAttributes(attributes)
+              }
+
+              
               try {
                 // @ts-ignore
                 const result = await original.apply(this, [record]);
-                span.setAttributes({
-                  'aws.lambda.batch.success': true,
-                });
+
                 return result;
               } catch (error) {
-                span.setAttributes({
-                  'aws.lambda.batch.success': false,
-                  'aws.lambda.batch.error':
-                    error instanceof Error ? error.message : String(error),
-                });
+                 span.setStatus({code: SpanStatusCode.ERROR, message: error instanceof Error ? error.message : String(error)})
                 throw error;
               } finally {
                 span.end();
